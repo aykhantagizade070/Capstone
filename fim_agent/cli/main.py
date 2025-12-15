@@ -7,7 +7,6 @@ import json
 import os
 import sys
 from dataclasses import asdict
-import getpass
 import logging
 from pathlib import Path
 from datetime import datetime
@@ -43,21 +42,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _verify_admin_password(config: Config) -> bool:
+def _check_admin_password_env(config: Config) -> bool:
     """
-    Verify admin password from environment variable.
-    Returns True if password is correct, False otherwise.
+    Check if admin password is set in environment variable (non-interactive).
+    Returns True if password is configured, False otherwise.
+    Does NOT prompt for password - admin approval is handled via web UI only.
     """
-    expected_password = os.getenv(config.admin_password_env_var)
+    expected_password = os.getenv(config.admin_password_env_var) or os.getenv("FIM_DASHBOARD_PASSWORD")
     if not expected_password:
-        print(f"Warning: Admin password not set in environment variable {config.admin_password_env_var}")
         return False
-    
-    try:
-        entered_password = getpass.getpass("Enter admin password for approval: ")
-        return entered_password == expected_password
-    except (KeyboardInterrupt, EOFError):
-        return False
+    return True
 
 
 def _configure_logging(config: Config) -> None:
@@ -108,23 +102,14 @@ def main() -> int:
                 if event.hash_changed:
                     print(f"⚠️  WARNING: File hash changed! Integrity violation detected.")
                 
-                if _verify_admin_password(config):
-                    # Update event approval status
-                    event.admin_approved = True
-                    # Update in storage
-                    storage.conn.execute(
-                        """
-                        UPDATE events
-                        SET admin_approved = 1
-                        WHERE timestamp = ? AND path = ? AND event_type = ?
-                        """,
-                        (event.timestamp.isoformat(), event.path, event.event_type),
-                    )
-                    storage.conn.commit()
-                    print("✓ Admin approval granted. Event acknowledged.")
+                # Admin approval is handled via web UI only - no CLI password prompt
+                has_password_env = _check_admin_password_env(config)
+                if has_password_env:
+                    print("⚠️  Admin approval required. Use the web UI to approve this event.")
                 else:
-                    print("✗ Admin password incorrect. Event NOT approved.")
-                    event.admin_approved = False
+                    print(f"⚠️  Admin approval required. Set {config.admin_password_env_var} or FIM_DASHBOARD_PASSWORD to enable web UI approval.")
+                # Event remains pending approval (admin_approved = False) until approved via web UI
+                event.admin_approved = False
             
             # Log the event
             if config.log_format == "json":

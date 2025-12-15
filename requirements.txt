@@ -3,4 +3,5 @@ fastapi
 uvicorn
 pytest
 pyyaml
+openai
 

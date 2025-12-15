@@ -221,6 +221,49 @@ def setup_logging(config: Config) -> logging.Logger:
     return logger
 
 
+def get_logger(name: str = "fim_agent") -> logging.Logger:
+    """
+    Get a configured logger instance.
+    
+    If the "fim_agent" logger has been configured via setup_logging(),
+    child loggers (e.g., "fim_agent.core.ai_client") will automatically
+    propagate messages to the parent logger's handlers. Otherwise, a
+    basic handler is added as a fallback.
+    
+    Args:
+        name: Logger name (default: "fim_agent")
+        
+    Returns:
+        Configured logger instance
+    """
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    
+    # Check if the root "fim_agent" logger has handlers configured
+    root_logger = logging.getLogger("fim_agent")
+    
+    # If this is the root logger and it has handlers, we're done
+    if name == "fim_agent" and root_logger.handlers:
+        return logger
+    
+    # If this is a child logger (e.g., "fim_agent.core.ai_client"),
+    # it will automatically propagate to the parent "fim_agent" logger
+    # if the parent has handlers configured. We don't need to add
+    # handlers to child loggers in that case.
+    # 
+    # Only add a fallback handler if:
+    # 1. The root logger has no handlers (setup_logging hasn't been called), AND
+    # 2. This logger itself has no handlers
+    if not root_logger.handlers and not logger.handlers:
+        # Add a basic stream handler to avoid "No handlers" warnings
+        # This is a fallback if setup_logging hasn't been called
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(TextEventFormatter())
+        logger.addHandler(stream_handler)
+    
+    return logger
+
+
 def format_event_text(event: Event) -> str:
     """Return human-readable line for an event."""
     alert_prefix = "ALERT " if event.is_alert else ""
@@ -242,5 +285,5 @@ def event_to_log_payload(event: Event, wazuh_format: bool = False) -> Dict[str, 
     return _event_to_dict(event, wazuh_format=wazuh_format)
 
 
-__all__ = ["setup_logging", "format_event_text", "event_to_log_payload"]
+__all__ = ["setup_logging", "get_logger", "format_event_text", "event_to_log_payload"]
 

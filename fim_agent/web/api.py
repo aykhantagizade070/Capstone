@@ -10,10 +10,22 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Query, Body, Cookie, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
+from pydantic import BaseModel
 
 from fim_agent.core.config import Config
 from fim_agent.core.storage import Storage
 from fim_agent.core.events import Event
+
+
+class AdminApprovalRequest(BaseModel):
+    """Request model for admin approval endpoint."""
+    password: str
+    approve: bool = True
+
+
+class AdminApproveRequest(BaseModel):
+    """Request model for admin approval endpoint."""
+    password: str
 
 
 def create_app(config: Config) -> FastAPI:
@@ -95,6 +107,7 @@ def create_app(config: Config) -> FastAPI:
 
     @app.get("/api/events")
     def get_events(
+        request: Request,
         severity: Optional[str] = Query(None, description="Filter by severity (low/medium/high)"),
         classification: Optional[str] = Query(None, description="Filter by content_classification"),
         min_risk: Optional[int] = Query(None, description="Minimum risk_score"),
@@ -107,6 +120,10 @@ def create_app(config: Config) -> FastAPI:
         Get events with optional filtering and pagination.
         Returns events in descending chronological order (newest first).
         """
+        # Get optional admin approval filters from query params
+        requires_admin_approval_param = request.query_params.get("requires_admin_approval")
+        admin_approved_param = request.query_params.get("admin_approved")
+        
         events = storage.get_events(
             severity=severity,  # type: ignore[arg-type]
             classification=classification,
@@ -116,6 +133,16 @@ def create_app(config: Config) -> FastAPI:
             offset=offset,
             order_desc=True,
         )
+        
+        # Filter by admin approval flags if provided
+        if requires_admin_approval_param is not None:
+            flag = requires_admin_approval_param.lower() == "true"
+            events = [ev for ev in events if getattr(ev, "requires_admin_approval", False) == flag]
+        
+        if admin_approved_param is not None:
+            flag = admin_approved_param.lower() == "true"
+            events = [ev for ev in events if getattr(ev, "admin_approved", None) == flag]
+        
         return {
             "events": [event_to_dict(ev) for ev in events],
             "count": len(events),
@@ -130,6 +157,38 @@ def create_app(config: Config) -> FastAPI:
         if not event:
             raise HTTPException(status_code=404, detail=f"Event with id {event_id} not found")
         return event_to_dict(event)
+
+    @app.post("/api/events/{event_id}/approve")
+    def approve_event(
+        event_id: int,
+        body: AdminApproveRequest,
+        auth: bool = Depends(require_auth),
+    ) -> Dict[str, Any]:
+        """
+        Approve an event that requires admin approval.
+        Sets admin_approved = True if password is correct.
+        """
+        admin_password = (
+            os.getenv("FIM_ADMIN_PASSWORD")
+            or os.getenv("FIM_DASHBOARD_PASSWORD")
+        )
+        if not admin_password or body.password != admin_password:
+            raise HTTPException(status_code=401, detail="Invalid admin password")
+
+        event = storage.get_event_by_id(event_id)
+        if not event:
+            raise HTTPException(status_code=404, detail="Event not found")
+
+        if not getattr(event, "requires_admin_approval", False):
+            return {"success": False, "detail": "Event does not require admin approval"}
+
+        # Update the event approval status using storage
+        updated_event = storage.set_admin_approved(event_id, True)
+        if not updated_event:
+            raise HTTPException(status_code=404, detail="Event not found")
+
+        # Reuse the existing to_dict() logic / response format
+        return {"success": True, "event": event_to_dict(updated_event)}
 
     @app.get("/api/stats/summary")
     def get_stats_summary(auth: bool = Depends(require_auth)) -> Dict[str, Any]:

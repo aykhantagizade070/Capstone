@@ -1,4 +1,18 @@
-"""File system watcher for real-time monitoring."""
+"""
+File system watcher for real-time monitoring.
+
+MODIFICATIONS FOR NON-INTERACTIVE ADMIN APPROVAL:
+- All admin approval is handled via the web UI only. No CLI password prompts.
+- When events require admin approval (requires_admin_approval=True), the watcher:
+  * Logs a warning message with event details
+  * Sets event.requires_admin_approval = True
+  * Sets event.admin_approved = False
+  * Continues processing immediately without blocking
+- Modified functions:
+  * _process_move(): Added non-interactive logging for admin approval (lines ~384-390)
+  * _process(): Added non-interactive logging for admin approval (lines ~519-525)
+- No calls to input(), getpass.getpass(), or any stdin-based password prompts exist.
+"""
 
 from __future__ import annotations
 
@@ -26,6 +40,34 @@ from fim_agent.core.governance import TAMPER_EVENTS, mark_requires_admin_approva
 from fim_agent.core.hasher import compute_file_hash
 from fim_agent.core.storage import Storage
 from fim_agent.core.content_inspector import analyze_file_content
+from fim_agent.core.ai_client import analyze_event_with_ai
+from fim_agent.core.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+def _should_analyze_with_ai(event: Event) -> bool:
+    """
+    Determine if an event is "interesting" enough to call OpenAI API.
+    
+    Only call OpenAI for events that meet certain criteria to control costs:
+    - event.is_alert is True, OR
+    - risk_score >= 60, OR
+    - content_classification in {"private", "secret"}
+    
+    Args:
+        event: The event to check
+        
+    Returns:
+        True if event should be analyzed with AI, False otherwise
+    """
+    if event.is_alert:
+        return True
+    if event.risk_score is not None and event.risk_score >= 60:
+        return True
+    if event.content_classification in ("private", "secret"):
+        return True
+    return False
 
 
 HandlerCallback = Callable[[Event], None]
@@ -312,17 +354,32 @@ class WatchHandler(FileSystemEventHandler):
         from fim_agent.core.events import derive_severity_from_risk
         event_obj.severity = derive_severity_from_risk(event_obj.risk_score)
         
+        # Run rule-based AI classification first (fallback)
         ai_class, ai_risk, ai_reason = simple_ai_classification(event_obj)
         event_obj.ai_classification = ai_class
         event_obj.ai_risk_score = ai_risk
         event_obj.ai_risk_reason = ai_reason
         
-        # Generate comprehensive AI recommendation (overrides simple recommendation from simple_ai_classification)
+        # Generate rule-based AI recommendation (fallback)
         from fim_agent.core.governance import generate_ai_recommendation
         event_obj.ai_recommendation = generate_ai_recommendation(event_obj)
         
         # Mark as alert if thresholds are met (includes forced alerts for tamper events on sensitive files)
         mark_alert(event_obj, self.config.alert_min_risk_score, self.config.alert_min_ai_risk_score)
+        
+        # Optionally enhance with real OpenAI AI analysis for "interesting" events
+        if _should_analyze_with_ai(event_obj):
+            ai_result = analyze_event_with_ai(event_obj)
+            if ai_result:
+                # Override/augment fields only if OpenAI returned valid data
+                if "classification" in ai_result:
+                    event_obj.ai_classification = ai_result["classification"]
+                if "ai_risk_score" in ai_result:
+                    event_obj.ai_risk_score = ai_result["ai_risk_score"]
+                if "reason" in ai_result:
+                    event_obj.ai_risk_reason = ai_result["reason"]
+                if "remediation" in ai_result:
+                    event_obj.ai_recommendation = ai_result["remediation"]
         
         # For rename/move events, update SENSITIVE_PATHS if old path was sensitive
         if event_obj.event_type in ("rename", "move_internal", "move_in", "move_out") and event_obj.old_path:
@@ -337,6 +394,17 @@ class WatchHandler(FileSystemEventHandler):
         # For move_in and TAMPER_EVENTS, call mark_requires_admin_approval
         if event_obj.event_type == "move_in" or event_obj.event_type in TAMPER_EVENTS:
             mark_requires_admin_approval(event_obj, self.config)
+        
+        # Log warning if admin approval is required (non-interactive - web UI handles approval)
+        if event_obj.requires_admin_approval:
+            logger.warning("ADMIN APPROVAL REQUIRED for event %s (path=%s, risk_score=%s)", 
+                          event_obj.event_type, 
+                          getattr(event_obj, "path", None),
+                          getattr(event_obj, "risk_score", None))
+            # Ensure flags are set correctly - web UI will handle actual approval
+            event_obj.requires_admin_approval = True
+            event_obj.admin_approved = False
+        
         # Persist event before notifying callback
         self.storage.record_event(event_obj)
         self.callback(event_obj)
@@ -434,21 +502,47 @@ class WatchHandler(FileSystemEventHandler):
         from fim_agent.core.events import derive_severity_from_risk
         event.severity = derive_severity_from_risk(event.risk_score)
         
+        # Run rule-based AI classification first (fallback)
         ai_class, ai_risk, ai_reason = simple_ai_classification(event)
         event.ai_classification = ai_class
         event.ai_risk_score = ai_risk
         event.ai_risk_reason = ai_reason
         
-        # Generate comprehensive AI recommendation
+        # Generate rule-based AI recommendation (fallback)
         from fim_agent.core.governance import generate_ai_recommendation
         event.ai_recommendation = generate_ai_recommendation(event)
         
         # Mark as alert if thresholds are met (includes forced alerts for tamper events on sensitive files)
         mark_alert(event, self.config.alert_min_risk_score, self.config.alert_min_ai_risk_score)
         
+        # Optionally enhance with real OpenAI AI analysis for "interesting" events
+        if _should_analyze_with_ai(event):
+            ai_result = analyze_event_with_ai(event)
+            if ai_result:
+                # Override/augment fields only if OpenAI returned valid data
+                if "classification" in ai_result:
+                    event.ai_classification = ai_result["classification"]
+                if "ai_risk_score" in ai_result:
+                    event.ai_risk_score = ai_result["ai_risk_score"]
+                if "reason" in ai_result:
+                    event.ai_risk_reason = ai_result["reason"]
+                if "remediation" in ai_result:
+                    event.ai_recommendation = ai_result["remediation"]
+        
         # For CREATE and TAMPER_EVENTS, call mark_requires_admin_approval
         if event.event_type == "create" or event.event_type in TAMPER_EVENTS:
             mark_requires_admin_approval(event, self.config)
+        
+        # Log warning if admin approval is required (non-interactive - web UI handles approval)
+        if event.requires_admin_approval:
+            logger.warning("ADMIN APPROVAL REQUIRED for event %s (path=%s, risk_score=%s)", 
+                          event.event_type, 
+                          getattr(event, "path", None),
+                          getattr(event, "risk_score", None))
+            # Ensure flags are set correctly - web UI will handle actual approval
+            event.requires_admin_approval = True
+            event.admin_approved = False
+        
         # Persist event before notifying callback
         self.storage.record_event(event)
         self.callback(event)
