@@ -53,6 +53,9 @@ class Event:
     content_flags: Optional[List[str]] = None  # Content inspection flags
     ai_recommendation: Optional[str] = None  # AI-driven recommendation based on content
     first_seen: Optional[bool] = None  # True if this is the first time we observe this file path
+    # Sticky privacy / effective classification (optional, nullable; for UI/debugging)
+    sticky_private: Optional[bool] = None
+    effective_classification: Optional[str] = None
 
 
 def calculate_severity(path: str) -> Severity:

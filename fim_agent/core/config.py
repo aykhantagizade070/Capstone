@@ -25,6 +25,7 @@ class Config:
     admin_min_risk_score: int = 80
     admin_min_ai_risk_score: int = 75
     admin_password_env_var: str = "FIM_ADMIN_PASSWORD"
+    enable_ai: bool = True
 
 
 def _project_root() -> Path:
@@ -75,6 +76,7 @@ def load_config(path: Optional[str] = None) -> Config:
         admin_min_risk_score=int(raw.get("admin_min_risk_score") or 80),
         admin_min_ai_risk_score=int(raw.get("admin_min_ai_risk_score") or 75),
         admin_password_env_var=str(raw.get("admin_password_env_var") or "FIM_ADMIN_PASSWORD"),
+        enable_ai=bool(raw.get("enable_ai", True)),
     )
 
 

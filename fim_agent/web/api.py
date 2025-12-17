@@ -103,6 +103,8 @@ def create_app(config: Config) -> FastAPI:
             "content_flags": event.content_flags,
             "ai_recommendation": event.ai_recommendation,
             "first_seen": event.first_seen,
+            "sticky_private": getattr(event, "sticky_private", None),
+            "effective_classification": getattr(event, "effective_classification", None),
         }
 
     @app.get("/api/events")
@@ -140,8 +142,18 @@ def create_app(config: Config) -> FastAPI:
             events = [ev for ev in events if getattr(ev, "requires_admin_approval", False) == flag]
         
         if admin_approved_param is not None:
-            flag = admin_approved_param.lower() == "true"
-            events = [ev for ev in events if getattr(ev, "admin_approved", None) == flag]
+            val = admin_approved_param.lower()
+            if val == "true":
+                events = [ev for ev in events if getattr(ev, "admin_approved", None) is True]
+            elif val == "false":
+                # Treat NULL as "not approved" (pending) as well as explicit false/0
+                events = [
+                    ev for ev in events
+                    if getattr(ev, "admin_approved", None) in (None, False)
+                ]
+            else:
+                # Unknown value - no-op to preserve backward compatibility
+                pass
         
         return {
             "events": [event_to_dict(ev) for ev in events],

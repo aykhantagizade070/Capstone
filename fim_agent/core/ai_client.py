@@ -11,6 +11,9 @@ from fim_agent.core.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+_AI_DISABLED: bool = False
+_AI_401_LOGGED: bool = False
+
 
 def get_openai_client() -> Optional[Any]:
     """
@@ -21,6 +24,8 @@ def get_openai_client() -> Optional[Any]:
     """
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key or not api_key.strip():
+        return None
+    if _AI_DISABLED:
         return None
     
     try:
@@ -155,6 +160,16 @@ def analyze_event_with_ai(event: Event) -> Dict[str, Any]:
         return result
         
     except Exception as e:
+        global _AI_DISABLED, _AI_401_LOGGED
+        msg = str(e)
+        status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+        is_401 = (status == 401) or ("401" in msg and "Unauthorized" in msg) or ("401" in msg and "unauthor" in msg.lower())
+        if is_401:
+            _AI_DISABLED = True
+            if not _AI_401_LOGGED:
+                _AI_401_LOGGED = True
+                logger.warning("OpenAI returned 401 Unauthorized. Disabling AI for this run; falling back to local rules.")
+            return {}
         logger.warning(f"OpenAI API call failed: {e}", exc_info=True)
         return {}
 

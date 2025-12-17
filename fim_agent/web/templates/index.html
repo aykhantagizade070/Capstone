@@ -1526,7 +1526,9 @@
             const text = document.getElementById("admin-approval-text");
 
             if (text) {
-                text.textContent = `Private/sensitive file modified: ${event.path}\nRisk score: ${event.risk_score}. Enter admin password to approve this change.`;
+                const sev = event.severity ? String(event.severity).toUpperCase() : "N/A";
+                const risk = (event.risk_score !== null && event.risk_score !== undefined) ? event.risk_score : "N/A";
+                text.textContent = `Private/sensitive file modified: ${event.path}\nSeverity: ${sev} | Risk score: ${risk}. Enter admin password to approve this change.`;
             }
 
             const pwd = document.getElementById("admin-approval-password");
@@ -1535,12 +1537,17 @@
             if (err) err.textContent = "";
 
             if (modal) modal.classList.remove("hidden");
+            if (pwd) setTimeout(() => pwd.focus(), 0);
         }
 
         function hideAdminApprovalModal() {
             const modal = document.getElementById("admin-approval-modal");
             if (modal) modal.classList.add("hidden");
             pendingApprovalEvent = null;
+            // Refresh pending list so "Later" immediately shows the event in Pending Admin Approvals
+            if (typeof loadPendingApprovals === "function") {
+                loadPendingApprovals().catch(() => {});
+            }
         }
 
         async function pollPendingApprovals() {
@@ -1591,6 +1598,9 @@
                 await loadSummary();
                 await loadRiskPie();
                 await loadEvents(currentFilterParams || "");
+                if (typeof loadPendingApprovals === "function") {
+                    await loadPendingApprovals();
+                }
             } catch (err) {
                 console.error("Approval failed", err);
                 if (errorBox) errorBox.textContent = "Approval error — check console";
@@ -1648,6 +1658,7 @@
                 
                 data.events.forEach(event => {
                     const row = document.createElement('tr');
+                    const eid = event.id ?? event.event_id;
                     row.innerHTML = `
                         <td>${formatTimestamp(event.timestamp)}</td>
                         <td>${event.event_type}</td>
@@ -1656,13 +1667,26 @@
                         <td>${event.content_classification ? 
                             `<span class="badge classification-${event.content_classification}">${event.content_classification}</span>` : 
                             '-'}</td>
-                        <td>
-                            <button onclick="openApprovalModal(${event.id}, ${JSON.stringify(event.path)}, ${event.risk_score || 0})" 
-                                    style="padding: 6px 12px; background-color: #f59e0b; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 12px;">
-                                Review
-                            </button>
-                        </td>
+                        <td></td>
                     `;
+
+                    const actionsCell = row.lastElementChild;
+                    const btn = document.createElement("button");
+                    btn.type = "button";
+                    btn.textContent = "Review";
+                    btn.setAttribute(
+                        "style",
+                        "padding: 6px 12px; background-color: #f59e0b; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 12px;"
+                    );
+                    btn.onclick = () => {
+                        if (!eid) {
+                            alert("Missing event id");
+                            return;
+                        }
+                        openApprovalModal(eid, event.path, event.risk_score || 0);
+                    };
+                    if (actionsCell) actionsCell.appendChild(btn);
+
                     tbody.appendChild(row);
                 });
             } catch (error) {
@@ -1672,23 +1696,31 @@
             }
         }
 
-        // Open approval modal
-        function openApprovalModal(eventId, path, riskScore) {
+        // Open approval modal (Pending table "Review"): load full event detail, then reuse the existing Admin Approval Modal
+        async function openApprovalModal(eventId, path, riskScore) {
+            if (!eventId) {
+                alert("Missing event id");
+                return;
+            }
             currentApprovalEventId = eventId;
-            document.getElementById('approval-event-id').textContent = eventId;
-            document.getElementById('approval-event-path').textContent = path;
-            document.getElementById('approval-risk-score').textContent = riskScore;
-            document.getElementById('admin-password').value = '';
-            document.getElementById('approval-error').innerHTML = '';
-            document.getElementById('approval-modal').classList.add('active');
+            try {
+                const res = await fetch(`/api/events/${eventId}`, { credentials: "include" });
+                if (res.ok) {
+                    const ev = await res.json();
+                    showAdminApprovalModal(ev);
+                    return;
+                }
+            } catch (err) {
+                console.error("Failed to load event details for approval modal", err);
+            }
+            // Fallback: use row data
+            showAdminApprovalModal({ id: eventId, path: path, risk_score: riskScore });
         }
 
         // Close approval modal
         function closeApprovalModal() {
-            document.getElementById('approval-modal').classList.remove('active');
             currentApprovalEventId = null;
-            document.getElementById('admin-password').value = '';
-            document.getElementById('approval-error').innerHTML = '';
+            hideAdminApprovalModal();
         }
 
         // Submit approval/rejection
@@ -1697,10 +1729,11 @@
                 return;
             }
 
-            const password = document.getElementById('admin-password').value;
+            const errorBox = document.getElementById("admin-approval-error");
+            const pwdInput = document.getElementById("admin-approval-password");
+            const password = pwdInput ? pwdInput.value.trim() : "";
             if (!password) {
-                document.getElementById('approval-error').innerHTML = 
-                    '<div class="error">Please enter admin password</div>';
+                if (errorBox) errorBox.textContent = "Please enter admin password";
                 return;
             }
 
@@ -1718,34 +1751,24 @@
                 });
 
                 if (!response.ok) {
-                    const error = await response.json();
-                    throw new Error(error.detail || 'Failed to approve event');
+                    if (errorBox) errorBox.textContent = "Invalid admin password";
+                    return;
                 }
 
-                const result = await response.json();
-                
                 // Close modal
                 closeApprovalModal();
                 
                 // Reload pending approvals and events
                 loadPendingApprovals();
                 loadEventsWithFilters();
-                
-                // Show success message
-                alert(result.message || (approved ? 'Event approved successfully' : 'Event rejected'));
             } catch (error) {
                 console.error('Error approving event:', error);
-                document.getElementById('approval-error').innerHTML = 
-                    `<div class="error">${error.message || 'Failed to approve event'}</div>`;
+                if (errorBox) errorBox.textContent = "Approval error — check console";
             }
         }
 
         // Close approval modal on outside click
-        document.getElementById('approval-modal').addEventListener('click', function(e) {
-            if (e.target === this) {
-                closeApprovalModal();
-            }
-        });
+        // (Old approval modal removed/unused; keep behavior via admin-approval-modal)
 
         // Update summary cards
         function updateSummaryCards(stats) {
@@ -2050,7 +2073,7 @@
                     <div id="admin-approval-panel" class="admin-approval-panel" style="display:none;">
                         <h4>Admin approval required</h4>
                         <p>This event modified a sensitive/private file. Enter the admin password to approve.</p>
-                        <input type="password" id="admin-approval-password" placeholder="Admin password" />
+                        <input type="password" id="admin-approval-password-inline" placeholder="Admin password" />
                         <div id="admin-approval-error" class="error-message" style="display:none;"></div>
                         <div class="modal-actions">
                             <button id="admin-approve-btn" class="btn btn-primary">Approve</button>
@@ -2100,7 +2123,7 @@
         // Submit admin approval
         async function submitAdminApproval() {
             if (!currentEvent) return;
-            const pwdInput = document.getElementById("admin-approval-password");
+            const pwdInput = document.getElementById("admin-approval-password-inline");
             const errorBox = document.getElementById("admin-approval-error");
             const password = pwdInput ? pwdInput.value : "";
 

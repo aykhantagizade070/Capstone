@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, List
@@ -21,6 +22,11 @@ class Storage:
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
 
+    @staticmethod
+    def _norm_path(path: str) -> str:
+        """Normalize paths consistently for DB reads/writes."""
+        return os.path.normcase(os.path.abspath(path))
+
     def init_schema(self) -> None:
         """Create tables if they do not exist."""
         self.conn.execute(
@@ -31,7 +37,8 @@ class Storage:
                 hash TEXT,
                 first_seen TEXT,
                 last_seen TEXT,
-                last_event_type TEXT
+                last_event_type TEXT,
+                is_private INTEGER DEFAULT 0
             )
             """
         )
@@ -72,6 +79,7 @@ class Storage:
         )
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp)")
         self._ensure_event_columns()
+        self._ensure_files_columns()
         self.conn.commit()
 
     def _ensure_event_columns(self) -> None:
@@ -99,14 +107,28 @@ class Storage:
             "old_path": "TEXT",
             "requires_admin_approval": "INTEGER",
             "admin_approved": "INTEGER",
+            "sticky_private": "INTEGER",
+            "effective_classification": "TEXT",
         }
         for col, col_type in needed.items():
             if col not in existing:
                 self.conn.execute(f"ALTER TABLE events ADD COLUMN {col} {col_type}")
 
+    def _ensure_files_columns(self) -> None:
+        """Add missing files columns for forward compatibility."""
+        cursor = self.conn.execute("PRAGMA table_info(files)")
+        existing = {row[1] for row in cursor.fetchall()}
+        needed = {
+            "is_private": "INTEGER DEFAULT 0",
+        }
+        for col, col_type in needed.items():
+            if col not in existing:
+                self.conn.execute(f"ALTER TABLE files ADD COLUMN {col} {col_type}")
+
     def get_file(self, path: str) -> Optional[Dict[str, Any]]:
         """Fetch a file record by path."""
-        cursor = self.conn.execute("SELECT * FROM files WHERE path = ?", (path,))
+        norm_path = self._norm_path(path)
+        cursor = self.conn.execute("SELECT * FROM files WHERE path = ?", (norm_path,))
         row = cursor.fetchone()
         if not row:
             return None
@@ -124,6 +146,7 @@ class Storage:
 
     def upsert_file(self, path: str, file_hash: str, event_type: str, timestamp: datetime) -> None:
         """Insert or update a file record."""
+        norm_path = self._norm_path(path)
         ts = timestamp.isoformat()
         self.conn.execute(
             """
@@ -134,7 +157,7 @@ class Storage:
                 last_seen=excluded.last_seen,
                 last_event_type=excluded.last_event_type
             """,
-            (path, file_hash, ts, ts, event_type),
+            (norm_path, file_hash, ts, ts, event_type),
         )
         self.conn.commit()
 
@@ -152,12 +175,15 @@ class Storage:
         If new_path already exists, merge/update it with the old_path's data.
         """
         # Check if old_path exists
-        old_record = self.get_file(old_path)
+        old_norm = self._norm_path(old_path)
+        new_norm = self._norm_path(new_path)
+
+        old_record = self.get_file(old_norm)
         if not old_record:
             return
         
         # Check if new_path already exists
-        new_record = self.get_file(new_path)
+        new_record = self.get_file(new_norm)
         
         if new_record:
             # new_path already exists - merge: update new_path with old_path's data, then delete old_path
@@ -195,11 +221,11 @@ class Storage:
                     first_seen,  # Preserve earlier first_seen
                     last_seen,  # Use more recent last_seen
                     old_record["last_event_type"],
-                    new_path,
+                    new_norm,
                 ),
             )
             # Delete the old_path row
-            self.conn.execute("DELETE FROM files WHERE path = ?", (old_path,))
+            self.conn.execute("DELETE FROM files WHERE path = ?", (old_norm,))
         else:
             # new_path doesn't exist - simple update
             self.conn.execute(
@@ -208,27 +234,30 @@ class Storage:
                 SET path = ?
                 WHERE path = ?
                 """,
-                (new_path, old_path),
+                (new_norm, old_norm),
             )
         self.conn.commit()
 
     def record_event(self, event: Event) -> None:
         """Persist an Event to the events table."""
         try:
+            norm_path = self._norm_path(event.path)
+            norm_old_path = self._norm_path(event.old_path) if event.old_path else None
             self.conn.execute(
                 """
                 INSERT INTO events (
                     timestamp, event_type, path, old_hash, new_hash, severity, mitre_tags, message,
                     user, user_type, process_name, sha256, previous_sha256, hash_changed,
                     content_classification, risk_score, ai_classification, ai_risk_score, ai_risk_reason, is_alert, old_path,
-                    requires_admin_approval, admin_approved, content_score, content_flags, ai_recommendation, classification_matches
+                    requires_admin_approval, admin_approved, content_score, content_flags, ai_recommendation, classification_matches,
+                    sticky_private, effective_classification
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.timestamp.isoformat(),
                     event.event_type,
-                    event.path,
+                    norm_path,
                     event.old_hash,
                     event.new_hash,
                     event.severity,
@@ -246,13 +275,15 @@ class Storage:
                     event.ai_risk_score,
                     event.ai_risk_reason,
                     int(event.is_alert) if event.is_alert is not None else 0,
-                    event.old_path,
+                    norm_old_path,
                     int(event.requires_admin_approval) if event.requires_admin_approval is not None else 0,
                     int(event.admin_approved) if event.admin_approved is not None else None,
                     event.content_score,
                     json.dumps(event.content_flags) if event.content_flags else None,
                     event.ai_recommendation,
                     json.dumps(event.classification_matches) if event.classification_matches else None,
+                    int(event.sticky_private) if event.sticky_private is not None else None,
+                    event.effective_classification,
                 ),
             )
             self.conn.commit()
@@ -272,6 +303,7 @@ class Storage:
         Returns True if an event was removed, False otherwise.
         Used to clean up DELETE events that are actually part of a move operation.
         """
+        norm_path = self._norm_path(path)
         cutoff = (datetime.utcnow() - timedelta(seconds=within_seconds)).isoformat()
         cursor = self.conn.execute(
             """
@@ -280,10 +312,46 @@ class Storage:
             ORDER BY timestamp DESC
             LIMIT 1
             """,
-            (path, cutoff),
+            (norm_path, cutoff),
         )
         self.conn.commit()
         return cursor.rowcount > 0
+
+    def get_is_private(self, path: str) -> int:
+        """Get persisted private state for a file path (0/1). Creates a row if missing."""
+        norm_path = self._norm_path(path)
+        row = self.conn.execute("SELECT is_private FROM files WHERE path = ?", (norm_path,)).fetchone()
+        if row is None:
+            # Create placeholder file row with default is_private=0; hash is unknown here
+            ts = datetime.utcnow().isoformat()
+            self.conn.execute(
+                """
+                INSERT INTO files (path, hash, first_seen, last_seen, last_event_type, is_private)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO NOTHING
+                """,
+                (norm_path, None, ts, ts, None, 0),
+            )
+            self.conn.commit()
+            return 0
+        val = row["is_private"]
+        return int(val) if val is not None else 0
+
+    def set_is_private(self, path: str, is_private: int) -> None:
+        """Persist private state (0/1) for a file path. Creates a row if missing."""
+        norm_path = self._norm_path(path)
+        ts = datetime.utcnow().isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO files (path, hash, first_seen, last_seen, last_event_type, is_private)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                is_private=excluded.is_private,
+                last_seen=excluded.last_seen
+            """,
+            (norm_path, None, ts, ts, None, int(is_private)),
+        )
+        self.conn.commit()
 
     def get_events(
         self,
@@ -376,6 +444,8 @@ class Storage:
                 content_flags=json.loads(row_dict["content_flags"]) if row_dict.get("content_flags") else None,
                 ai_recommendation=row_dict.get("ai_recommendation"),
                 classification_matches=json.loads(row_dict["classification_matches"]) if row_dict.get("classification_matches") else None,
+                sticky_private=bool(row_dict["sticky_private"]) if row_dict.get("sticky_private") is not None else None,
+                effective_classification=row_dict.get("effective_classification"),
             )
             # Store ID as an attribute (Event model doesn't have id field, but we can attach it)
             event.id = row_dict.get("id")  # type: ignore[attr-defined]
@@ -418,6 +488,8 @@ class Storage:
             content_flags=json.loads(row_dict["content_flags"]) if row_dict.get("content_flags") else None,
             ai_recommendation=row_dict.get("ai_recommendation"),
             classification_matches=json.loads(row_dict["classification_matches"]) if row_dict.get("classification_matches") else None,
+            sticky_private=bool(row_dict["sticky_private"]) if row_dict.get("sticky_private") is not None else None,
+            effective_classification=row_dict.get("effective_classification"),
         )
         event.id = row_dict.get("id")  # type: ignore[attr-defined]
         return event
@@ -484,14 +556,14 @@ class Storage:
         """
         Get events that require admin approval but haven't been approved yet.
         
-        Returns events where requires_admin_approval is true and admin_approved is NULL/None.
-        Ordered by timestamp descending (newest first).
+        Returns events where requires_admin_approval is true and admin_approved is NULL/None/0.
+        Ordered by id descending (newest first).
         """
         cursor = self.conn.execute(
             """
             SELECT * FROM events
-            WHERE requires_admin_approval = 1 AND admin_approved IS NULL
-            ORDER BY timestamp DESC
+            WHERE requires_admin_approval = 1 AND (admin_approved IS NULL OR admin_approved = 0)
+            ORDER BY id DESC
             LIMIT ?
             """,
             (limit,)

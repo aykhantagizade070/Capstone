@@ -36,7 +36,7 @@ from fim_agent.core.events import (
     simple_ai_classification,
     mark_alert,
 )
-from fim_agent.core.governance import TAMPER_EVENTS, mark_requires_admin_approval, SENSITIVE_PATHS, _norm_path
+from fim_agent.core.governance import TAMPER_EVENTS, SENSITIVE_PATHS, _norm_path
 from fim_agent.core.hasher import compute_file_hash
 from fim_agent.core.storage import Storage
 from fim_agent.core.content_inspector import analyze_file_content
@@ -68,6 +68,39 @@ def _should_analyze_with_ai(event: Event) -> bool:
     if event.content_classification in ("private", "secret"):
         return True
     return False
+
+
+def _apply_private_approval_gating(event: Event, prior_is_private: int) -> None:
+    """
+    Apply exact approval gating rules based on persisted per-file private state.
+    - first_time_private: curr_private and not prior_is_private => force no approval + no alert
+    - already_private and hash_changed == True => force approval + alert
+    """
+    curr_private = event.content_classification in ("private", "secret")
+    prior_private = bool(prior_is_private)
+    effective_private = prior_private or curr_private
+
+    # Expose sticky/effective state for UI/debugging (nullable fields)
+    event.sticky_private = True if effective_private else False
+    if effective_private:
+        event.effective_classification = "private"
+
+    # First time the classifier ever detects private/secret: do NOT block, do NOT alert
+    if curr_private and not prior_private:
+        event.requires_admin_approval = False
+        event.admin_approved = None
+        event.is_alert = False
+        event.first_seen = True
+        return
+
+    # Sticky private: even if classifier flips to public later, still gate on tamper/hash change
+    if effective_private and event.hash_changed is True:
+        event.requires_admin_approval = True
+        # Pending by default until admin explicitly approves/rejects
+        event.admin_approved = None
+        event.is_alert = True
+        event.first_seen = False
+        return
 
 
 HandlerCallback = Callable[[Event], None]
@@ -366,9 +399,13 @@ class WatchHandler(FileSystemEventHandler):
         
         # Mark as alert if thresholds are met (includes forced alerts for tamper events on sensitive files)
         mark_alert(event_obj, self.config.alert_min_risk_score, self.config.alert_min_ai_risk_score)
+
+        # Apply persisted per-file private approval gating (do NOT rely on previous events)
+        prior_is_private = self.storage.get_is_private(event_obj.path)
+        _apply_private_approval_gating(event_obj, prior_is_private)
         
         # Optionally enhance with real OpenAI AI analysis for "interesting" events
-        if _should_analyze_with_ai(event_obj):
+        if getattr(self.config, "enable_ai", True) and _should_analyze_with_ai(event_obj):
             ai_result = analyze_event_with_ai(event_obj)
             if ai_result:
                 # Override/augment fields only if OpenAI returned valid data
@@ -391,9 +428,9 @@ class WatchHandler(FileSystemEventHandler):
                 new_path = _norm_path(event_obj.path)
                 SENSITIVE_PATHS.add(new_path)
         
-        # For move_in and TAMPER_EVENTS, call mark_requires_admin_approval
-        if event_obj.event_type == "move_in" or event_obj.event_type in TAMPER_EVENTS:
-            mark_requires_admin_approval(event_obj, self.config)
+        # Persist private state after processing
+        if event_obj.content_classification in ("private", "secret"):
+            self.storage.set_is_private(event_obj.path, 1)
         
         # Log warning if admin approval is required (non-interactive - web UI handles approval)
         if event_obj.requires_admin_approval:
@@ -403,7 +440,8 @@ class WatchHandler(FileSystemEventHandler):
                           getattr(event_obj, "risk_score", None))
             # Ensure flags are set correctly - web UI will handle actual approval
             event_obj.requires_admin_approval = True
-            event_obj.admin_approved = False
+            if event_obj.admin_approved is False:
+                event_obj.admin_approved = None
         
         # Persist event before notifying callback
         self.storage.record_event(event_obj)
@@ -514,9 +552,13 @@ class WatchHandler(FileSystemEventHandler):
         
         # Mark as alert if thresholds are met (includes forced alerts for tamper events on sensitive files)
         mark_alert(event, self.config.alert_min_risk_score, self.config.alert_min_ai_risk_score)
+
+        # Apply persisted per-file private approval gating (do NOT rely on previous events)
+        prior_is_private = self.storage.get_is_private(event.path)
+        _apply_private_approval_gating(event, prior_is_private)
         
         # Optionally enhance with real OpenAI AI analysis for "interesting" events
-        if _should_analyze_with_ai(event):
+        if getattr(self.config, "enable_ai", True) and _should_analyze_with_ai(event):
             ai_result = analyze_event_with_ai(event)
             if ai_result:
                 # Override/augment fields only if OpenAI returned valid data
@@ -529,9 +571,9 @@ class WatchHandler(FileSystemEventHandler):
                 if "remediation" in ai_result:
                     event.ai_recommendation = ai_result["remediation"]
         
-        # For CREATE and TAMPER_EVENTS, call mark_requires_admin_approval
-        if event.event_type == "create" or event.event_type in TAMPER_EVENTS:
-            mark_requires_admin_approval(event, self.config)
+        # Persist private state after processing
+        if event.content_classification in ("private", "secret"):
+            self.storage.set_is_private(event.path, 1)
         
         # Log warning if admin approval is required (non-interactive - web UI handles approval)
         if event.requires_admin_approval:
@@ -541,7 +583,8 @@ class WatchHandler(FileSystemEventHandler):
                           getattr(event, "risk_score", None))
             # Ensure flags are set correctly - web UI will handle actual approval
             event.requires_admin_approval = True
-            event.admin_approved = False
+            if event.admin_approved is False:
+                event.admin_approved = None
         
         # Persist event before notifying callback
         self.storage.record_event(event)
