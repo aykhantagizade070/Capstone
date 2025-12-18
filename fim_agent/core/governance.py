@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Optional
 
 from fim_agent.core.config import Config
 from fim_agent.core.events import Event
 
-
 # Event types that represent tampering with existing files
 TAMPER_EVENTS = {"modify", "delete", "rename", "move_internal", "move_out"}
 
 # Module-level set to track paths that have been seen as sensitive
 SENSITIVE_PATHS: set[str] = set()
+
+# Grace window for "create -> immediate modify" noise (Notepad/Splunk davranışı)
+CREATE_GRACE: dict[str, float] = {}
+GRACE_SECONDS = 5
 
 
 def _norm_path(path: str | Path | None) -> str:
@@ -27,254 +31,235 @@ def _norm_path(path: str | Path | None) -> str:
 
 
 def is_sensitive(event: Event, config: Optional[Config] = None) -> bool:
-    """
-    Determine if an event involves sensitive content.
-    
-    Basic rule: private/secret content is sensitive.
-    Optional: treat very high risk score as sensitive too.
-    """
-    # Basic rule: private/secret content is sensitive
-    if event.content_classification in ("private", "secret"):
+    eff = getattr(event, "effective_classification", None)
+    cls = (eff or event.content_classification or "").lower()
+
+    # sticky_private varsa həmişə sensitive say
+    if bool(getattr(event, "sticky_private", False)):
         return True
-    
-    # Optional: treat very high risk score as sensitive too
+
+    if cls in ("private", "secret"):
+        return True
+
     threshold = getattr(config, "admin_min_risk_score", 80) if config else 80
-    if event.risk_score is not None and event.risk_score >= threshold:
-        return True
-    
-    return False
+    return event.risk_score is not None and event.risk_score >= threshold
 
 
 def mark_requires_admin_approval(event: Event, config: Optional[Config] = None) -> Event:
     """
     Admin approval rules:
-    
-    - A path that becomes sensitive for the first time: first_seen = True, no password required
-    - Any later tamper event on the same path: requires_admin_approval = True
-    - High-risk tamper events (risk_score >= admin_min_risk_score) always require approval
-    - When a path is no longer sensitive, it is removed from the set
+
+    - CREATE: heç vaxt approval istəmir
+    - create-dən dərhal sonra gələn modify (GRACE_SECONDS içində): approval istəmir (Notepad noise)
+    - private/secret faylda sonrakı tamper: approval istəyir
+    - high-risk tamper (risk_score >= admin_min_risk_score): approval istəyir
     """
-    # Default values
+    # Defaults
     event.requires_admin_approval = False
-    event.first_seen = False
     event.admin_approved = None
-    
+    event.first_seen = False
+
     # If admin approval is globally disabled, no approval needed
     if not config or not getattr(config, "require_admin_for_alerts", True):
         return event
-    
+
     # Only process CREATE and TAMPER_EVENTS
     if event.event_type != "create" and event.event_type not in TAMPER_EVENTS:
         return event
-    
-    # Normalize path for consistent comparison
+
     key = _norm_path(event.path)
-    
-    # Check if path was previously sensitive
     was_sensitive = key in SENSITIVE_PATHS
-    # Check if current event is sensitive
     now_sensitive = is_sensitive(event, config)
-    
-    # For CREATE events: ensure sensitive paths are tracked, but never require approval
+
+    # -------------------------
+    # CREATE: never require approval
+    # -------------------------
     if event.event_type == "create":
         if now_sensitive and not was_sensitive:
-            SENSITIVE_PATHS.add(key)  # Track newly sensitive path
-            event.first_seen = True
-        elif now_sensitive:
-            event.first_seen = False  # Already known sensitive path
-        else:
-            event.first_seen = not was_sensitive  # Not sensitive
-        event.requires_admin_approval = False  # CREATE never requires approval
-        event.admin_approved = None  # CREATE events don't need approval, leave as None
-        return event
-    
-    # Handle TAMPER_EVENTS
-    if event.event_type in TAMPER_EVENTS:
-        # Check for high-risk tamper event (independent of sensitive path logic)
-        admin_min_risk = getattr(config, "admin_min_risk_score", 80)
-        is_high_risk = (
-            event.risk_score is not None and 
-            event.risk_score >= admin_min_risk
-        )
-        
-        # Detect first-seen: baseline missing (previous_sha256 is None) OR first_seen is True
-        # This handles the Notepad case: create + immediate modify on brand-new file
-        # previous_sha256 will be None if baseline doesn't exist yet
-        is_first_seen = (
-            getattr(event, "previous_sha256", None) is None or
-            (getattr(event, "first_seen", None) is not None and getattr(event, "first_seen", None) is True)
-        )
-        
-        # Check if file is private/secret
-        is_private = now_sensitive
-        
-        # If private and first-seen (baseline missing): no alert, no approval
-        if is_private and is_first_seen:
-            SENSITIVE_PATHS.add(key)  # Track for future events
-            event.first_seen = True
-            event.requires_admin_approval = False
-            event.admin_approved = None
-            return event
-        
-        # If private and NOT first-seen (baseline exists): require alert + approval
-        if is_private and not is_first_seen:
-            # File was seen before and is now being tampered with
-            event.first_seen = False
-            event.requires_admin_approval = True
-            event.admin_approved = False
-            # Also ensure path is tracked
-            if not was_sensitive:
-                SENSITIVE_PATHS.add(key)
-            return event
-        
-        # Newly discovered sensitive path (first time becoming sensitive, but baseline exists)
-        # This is a transition case: file existed as public, now becomes private
-        if now_sensitive and not was_sensitive:
             SENSITIVE_PATHS.add(key)
-            # If baseline exists but wasn't sensitive before, this is a transition
-            if not is_first_seen:
-                # File existed before but just became sensitive: transition - force approval
-                event.first_seen = False
-                event.requires_admin_approval = True
-                event.admin_approved = False
-            else:
-                # Should have been caught by the is_private and is_first_seen check above
+            event.first_seen = True
+        elif now_sensitive and was_sensitive:
+            event.first_seen = False
+        else:
+            event.first_seen = not was_sensitive
+
+        event.requires_admin_approval = False
+        event.admin_approved = None
+
+        # mark grace start for this path (create -> immediate modify)
+        CREATE_GRACE[key] = time.time()
+        return event
+
+    # -------------------------
+    # TAMPER EVENTS
+    # -------------------------
+    if event.event_type in TAMPER_EVENTS:
+        # 1) Grace: create-dən dərhal sonra gələn modify-ləri approval-a salma
+        grace_t0 = CREATE_GRACE.get(key)
+        if grace_t0 is not None:
+            dt = time.time() - grace_t0
+            if dt <= GRACE_SECONDS and event.event_type == "modify":
+                # bu, yeni faylın "ilk yazılışı" kimi davransın
+                if now_sensitive:
+                    SENSITIVE_PATHS.add(key)
                 event.first_seen = True
                 event.requires_admin_approval = False
                 event.admin_approved = None
-            return event
-        
-        # Subsequent tampering with an already sensitive file (NOT first-seen)
-        if was_sensitive:
+                return event
+            # grace keçibsə təmizlə
+            if dt > GRACE_SECONDS:
+                CREATE_GRACE.pop(key, None)
+
+        # 2) sensitivity set update
+        if not now_sensitive and was_sensitive:
+            SENSITIVE_PATHS.discard(key)
+            was_sensitive = False
+        elif now_sensitive and not was_sensitive:
+            SENSITIVE_PATHS.add(key)
+            was_sensitive = True
+
+        # 3) high risk check
+        admin_min_risk = getattr(config, "admin_min_risk_score", 80)
+        is_high_risk = event.risk_score is not None and event.risk_score >= admin_min_risk
+
+        # 4) first-seen by baseline (brand new private file case)
+        baseline_missing = getattr(event, "previous_sha256", None) is None
+
+        # ---- Private/Sensitive tamper logic
+        if now_sensitive:
+            if baseline_missing:
+                # ilk dəfə görürük / baseline yoxdu -> approval istəmə
+                event.first_seen = True
+                event.requires_admin_approval = False
+                event.admin_approved = None
+                return event
+
+            # baseline var -> artıq tanınmış sensitive fayldır -> approval tələb et
             event.first_seen = False
             event.requires_admin_approval = True
             event.admin_approved = False
             return event
-        
-        # High-risk tamper event on non-sensitive path
+
+        # ---- Non-sensitive: only high-risk tamper requires approval
         if is_high_risk:
             event.first_seen = False
             event.requires_admin_approval = True
             event.admin_approved = False
             return event
-        
-        # Low-risk tamper event on non-sensitive path
+
+        # ---- Low-risk non-sensitive tamper: no approval
         event.first_seen = False
         event.requires_admin_approval = False
+        event.admin_approved = None
         return event
-    
-    # If it stopped being sensitive, forget it
-    if not now_sensitive and was_sensitive:
-        SENSITIVE_PATHS.discard(key)
-    
+
     return event
 
 
-
 def is_tamper_event(event: Event) -> bool:
-    """
-    Determine if an event represents tampering with an existing file.
-    
-    Returns True for event types that modify or remove existing files:
-    - modify, delete, rename, move_internal, move_out
-    """
     return event.event_type in TAMPER_EVENTS
 
 
 def generate_ai_recommendation(event: Event) -> str:
-    """
-    Return a short human-readable remediation hint for this event.
-    
-    This is NOT a real AI model, just rule-based logic that provides
-    actionable recommendations based on event characteristics.
-    """
     recommendations = []
-    
-    # High priority: Executable/script file drops
+
     if event.content_flags and "executable_drop" in event.content_flags:
         if event.event_type == "create":
-            recommendations.append("🚨 CRITICAL: New executable file detected. Verify source and scan for malware immediately.")
+            recommendations.append(
+                "🚨 CRITICAL: New executable file detected. Verify source and scan for malware immediately."
+            )
         elif event.event_type == "modify":
-            recommendations.append("🚨 CRITICAL: Executable file modified. Check for unauthorized code injection or updates.")
-    
-    # High priority: Hash changes indicate integrity violation
+            recommendations.append(
+                "🚨 CRITICAL: Executable file modified. Check for unauthorized code injection or updates."
+            )
+
     if event.hash_changed:
         if event.event_type == "modify":
-            recommendations.append("⚠️ INTEGRITY VIOLATION: File hash changed. Compare with baseline to identify unauthorized modifications.")
+            recommendations.append(
+                "⚠️ INTEGRITY VIOLATION: File hash changed. Compare with baseline to identify unauthorized modifications."
+            )
         elif event.event_type in ("rename", "move_internal"):
-            recommendations.append("⚠️ File moved/renamed with hash change. Verify this is expected and not a substitution attack.")
-    
-    # High priority: Sensitive content tampering
-    if event.content_classification in ("private", "secret"):
+            recommendations.append(
+                "⚠️ File moved/renamed with hash change. Verify this is expected and not a substitution attack."
+            )
+
+    eff = getattr(event, "effective_classification", None)
+    cls = (eff or event.content_classification or "").lower()
+    sticky_private = bool(getattr(event, "sticky_private", False))
+    is_priv = cls in ("private", "secret") or sticky_private
+
+    if is_priv:
         if event.event_type in TAMPER_EVENTS:
-            if event.requires_admin_approval and not event.admin_approved:
-                recommendations.append("🔒 SENSITIVE DATA TAMPERING: Private/secret file modified without admin approval. Review immediately and verify authorization.")
+            if event.requires_admin_approval and event.admin_approved is False:
+                recommendations.append(
+                    "🔒 SENSITIVE DATA TAMPERING: Private/secret file modified without admin approval. Review immediately and verify authorization."
+                )
             else:
-                recommendations.append("🔒 SENSITIVE DATA: Private/secret file accessed. Ensure proper authorization and audit access logs.")
+                recommendations.append(
+                    "🔒 SENSITIVE DATA: Private/secret file accessed. Ensure proper authorization and audit access logs."
+                )
         elif event.event_type == "create":
-            recommendations.append("🔒 SENSITIVE DATA CREATED: New file contains private/secret content. Verify data handling compliance.")
-        elif event.event_type == "move_in":
-            recommendations.append("🔒 SENSITIVE DATA INGESTED: File with private/secret content moved into monitored area. Verify source and classification.")
-    
-    # High priority: Suspicious content patterns
+            recommendations.append(
+                "🔒 SENSITIVE DATA CREATED: New file contains private/secret content. Verify data handling compliance."
+            )
+
     if event.content_flags:
         if "suspicious_base64" in event.content_flags:
-            recommendations.append("🔍 SUSPICIOUS: Multiple base64-encoded strings detected. May indicate obfuscated payload - analyze content manually.")
+            recommendations.append(
+                "🔍 SUSPICIOUS: Multiple base64-encoded strings detected. May indicate obfuscated payload - analyze content manually."
+            )
         if any("kw:" in flag for flag in event.content_flags):
             suspicious_kws = [f.replace("kw:", "") for f in event.content_flags if "kw:" in f]
-            recommendations.append(f"🔍 SUSPICIOUS KEYWORDS: Detected potentially malicious commands ({', '.join(suspicious_kws[:3])}). Review file content for script injection.")
-    
-    # Medium priority: High risk scores
+            recommendations.append(
+                f"🔍 SUSPICIOUS KEYWORDS: Detected potentially malicious commands ({', '.join(suspicious_kws[:3])}). Review file content for script injection."
+            )
+
     if event.risk_score is not None and event.risk_score >= 80:
         if event.event_type == "create":
-            recommendations.append("⚠️ HIGH RISK: New file with elevated risk score. Investigate source and purpose before allowing execution.")
+            recommendations.append(
+                "⚠️ HIGH RISK: New file with elevated risk score. Investigate source and purpose before allowing execution."
+            )
         elif event.event_type == "modify":
-            recommendations.append("⚠️ HIGH RISK: File modification with elevated risk score. Verify changes are authorized and expected.")
-    
-    # Medium priority: Delete events on sensitive files
+            recommendations.append(
+                "⚠️ HIGH RISK: File modification with elevated risk score. Verify changes are authorized and expected."
+            )
+
     if event.event_type == "delete":
-        if event.content_classification in ("private", "secret"):
-            recommendations.append("🗑️ DATA LOSS RISK: Sensitive file deleted. Check if this is expected or potential data exfiltration/destruction.")
+        if is_priv:
+            recommendations.append(
+                "🗑️ DATA LOSS RISK: Sensitive file deleted. Check if this is expected or potential data exfiltration/destruction."
+            )
         elif event.risk_score is not None and event.risk_score >= 60:
-            recommendations.append("🗑️ HIGH-RISK DELETE: Important file removed. Verify deletion is authorized and check for backup.")
+            recommendations.append(
+                "🗑️ HIGH-RISK DELETE: Important file removed. Verify deletion is authorized and check for backup."
+            )
         else:
             recommendations.append("📋 ROUTINE: File deletion detected. Verify this is expected system maintenance.")
-    
-    # Medium priority: Move/rename events
+
     if event.event_type in ("rename", "move_internal", "move_out"):
-        if event.content_classification in ("private", "secret"):
+        if is_priv:
             recommendations.append("📁 SENSITIVE FILE MOVED: Verify move is authorized and destination is secure.")
         elif event.risk_score is not None and event.risk_score >= 60:
             recommendations.append("📁 HIGH-RISK FILE MOVED: Verify move is expected and not an evasion attempt.")
         else:
             recommendations.append("📋 ROUTINE: File moved/renamed. Verify this is expected system activity.")
-    
-    # Medium priority: First seen files
+
     if event.first_seen:
-        if event.content_classification in ("private", "secret"):
-            recommendations.append("🆕 NEW SENSITIVE FILE: First observation of sensitive content. Classify and apply appropriate access controls.")
+        if is_priv:
+            recommendations.append(
+                "🆕 NEW SENSITIVE FILE: First observation of sensitive content. Classify and apply appropriate access controls."
+            )
         elif event.risk_score is not None and event.risk_score >= 50:
             recommendations.append("🆕 NEW FILE: First observation with moderate risk. Verify source and purpose.")
-    
-    # Low priority: Admin approval status
+
     if event.requires_admin_approval:
-        if not event.admin_approved:
+        if event.admin_approved is False:
             recommendations.append("⏳ PENDING APPROVAL: Event requires admin approval. Review and approve if authorized.")
-        else:
+        elif event.admin_approved is True:
             recommendations.append("✅ APPROVED: Event has been reviewed and approved by administrator.")
-    
-    # Low priority: MITRE tags indicate attack techniques
-    if event.mitre_tags:
-        if "Execution" in event.mitre_tags:
-            recommendations.append("⚔️ MITRE Execution: Potential code execution detected. Verify process and command are authorized.")
-        if "Defense Evasion" in event.mitre_tags:
-            recommendations.append("⚔️ MITRE Defense Evasion: Potential evasion technique detected. Review for anti-forensics activity.")
-        if "Persistence" in event.mitre_tags:
-            recommendations.append("⚔️ MITRE Persistence: Potential persistence mechanism. Check for unauthorized startup/registry changes.")
-        if "Exfiltration" in event.mitre_tags:
-            recommendations.append("⚔️ MITRE Exfiltration: File moved outside monitored area. Verify this is not data exfiltration.")
-    
-    # Default recommendation if nothing specific
+        else:
+            recommendations.append("⏳ PENDING APPROVAL: Approval status unknown. Refresh and verify event state.")
+
     if not recommendations:
         if event.event_type == "create":
             recommendations.append("📋 ROUTINE: New file created. Monitor for suspicious activity.")
@@ -282,20 +267,18 @@ def generate_ai_recommendation(event: Event) -> str:
             recommendations.append("📋 ROUTINE: File modified. Verify changes are expected.")
         else:
             recommendations.append("📋 ROUTINE: File system event detected. No immediate action required.")
-    
-    # Return the most critical recommendation first, or combine if multiple
+
     if len(recommendations) == 1:
         return recommendations[0]
-    elif len(recommendations) > 1:
-        # Prioritize: CRITICAL > INTEGRITY > SENSITIVE > SUSPICIOUS > HIGH RISK > others
-        priority_order = ["🚨", "⚠️", "🔒", "🔍", "🗑️", "📁", "🆕", "⏳", "✅", "⚔️", "📋"]
-        recommendations.sort(key=lambda r: (
+
+    priority_order = ["🚨", "⚠️", "🔒", "🔍", "🗑️", "📁", "🆕", "⏳", "✅", "⚔️", "📋"]
+    recommendations.sort(
+        key=lambda r: (
             next((i for i, p in enumerate(priority_order) if r.startswith(p)), len(priority_order)),
-            r
-        ))
-        return recommendations[0] + " " + " | ".join(recommendations[1:3])  # Show top 3
-    else:
-        return "📋 No specific recommendation. Monitor for patterns."
+            r,
+        )
+    )
+    return recommendations[0] + " " + " | ".join(recommendations[1:3])
 
 
 __all__ = [

@@ -5,7 +5,7 @@
 monitored_directories:
   - "./watched"
   - "./staging"
-
+  - "./watch"
 # Directories to exclude from monitoring
 exclude_directories:
   - "./.git"
