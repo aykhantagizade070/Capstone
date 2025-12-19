@@ -259,10 +259,6 @@ Each event includes:
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
-## 📄 License
-
-[Specify your license here]
-
 ## 🙏 Acknowledgments
 
 Built as a capstone project demonstrating real-world security monitoring capabilities.
