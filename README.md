@@ -43,7 +43,7 @@ The FIM Agent provides continuous monitoring of critical directories, maintainin
 
 1. **Clone the repository:**
 ```bash
-git clone <repository-url>
+git clone https://github.com/aykhantagizade070/Capstone.git
 cd capstone-g
 ```
 
