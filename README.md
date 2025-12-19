@@ -2,11 +2,11 @@
 
 A comprehensive, production-ready File Integrity Monitoring system designed to detect, log, and alert on file system changes in real-time. Built for security professionals, system administrators, and organizations requiring robust integrity monitoring capabilities.
 
-## 🎯 Overview
+##  Overview
 
 The FIM Agent provides continuous monitoring of critical directories, maintaining secure baselines of file hashes and generating detailed security logs with precise timestamps. It identifies what changed, when it changed, and why it matters from a security perspective, making it an essential tool for detecting unauthorized modifications, malware activity, and compliance violations.
 
-## ✨ Key Features
+##  Key Features
 
 ### Core Capabilities
 - **Real-Time Monitoring**: Continuous file system watching with instant event detection
@@ -31,13 +31,13 @@ The FIM Agent provides continuous monitoring of critical directories, maintainin
 - **Attacker Timeline View**: Chronological reconstruction of system activity
 - **Flexible Filtering**: Query events by severity, path, time range, and risk score
 
-## 📋 Requirements
+##  Requirements
 
 - Python 3.8 or higher
 - Windows, Linux, or macOS
 - SQLite3 (included with Python)
 
-## 🚀 Quick Start
+##  Quick Start
 
 ### Installation
 
@@ -75,7 +75,7 @@ python -m fim_agent.cli.main run-agent
 python -m fim_agent.cli.main timeline
 ```
 
-## 📖 Documentation
+##  Documentation
 
 Comprehensive documentation is available in the `docs/` directory:
 
@@ -83,7 +83,7 @@ Comprehensive documentation is available in the `docs/` directory:
 - **[Usage Guide](docs/usage.md)**: Detailed usage instructions and API reference
 - **[Interpreting Output](docs/interpreting_output.md)**: Understanding events, alerts, and SIEM integration
 
-## ⚙️ Configuration
+##  Configuration
 
 The FIM Agent is configured via YAML files. Key configuration options include:
 
@@ -109,7 +109,7 @@ admin_min_ai_risk_score: 75
 
 See `config/config_example.yaml` for a complete configuration reference.
 
-## 🔍 Usage Examples
+##  Usage Examples
 
 ### Command-Line Interface
 
@@ -149,7 +149,7 @@ curl "http://localhost:8080/api/events?severity=high&limit=50"
 curl "http://localhost:8080/api/events?min_risk=80"
 ```
 
-## 🏗️ Architecture
+##  Architecture
 
 The FIM Agent is built with a modular architecture:
 
@@ -177,7 +177,7 @@ The FIM Agent is built with a modular architecture:
 - **content_inspector.py**: Content analysis and classification
 - **ai_client.py**: AI-powered risk assessment
 
-## 🔒 Security Features
+##  Security Features
 
 ### Integrity Verification
 - SHA-256 hash-based file integrity checking
@@ -200,7 +200,7 @@ The FIM Agent is built with a modular architecture:
 - Password-protected web dashboard
 - Environment variable-based authentication
 
-## 📊 SIEM Integration
+##  SIEM Integration
 
 The FIM Agent produces SIEM-friendly logs in JSON format, compatible with Wazuh, Splunk, ELK Stack, and other platforms.
 
@@ -221,14 +221,14 @@ See [Interpreting Output](docs/interpreting_output.md#integrating-with-wazuh) fo
 - Alert rules
 - Query examples
 
-## 🧪 Testing
+##  Testing
 
 Run the test suite:
 ```bash
 pytest tests/
 ```
 
-## 📝 Event Types
+##  Event Types
 
 The FIM Agent detects and logs the following event types:
 
@@ -247,7 +247,7 @@ Each event includes:
 - AI risk assessment
 - User and process information (when available)
 
-## 🎯 Use Cases
+##  Use Cases
 
 - **Security Monitoring**: Detect unauthorized file modifications and malware activity
 - **Compliance**: Maintain audit trails for regulatory requirements
@@ -255,11 +255,11 @@ Each event includes:
 - **Change Management**: Track and verify authorized system modifications
 - **Forensics**: Detailed logging for security investigations
 
-## 🤝 Contributing
+##  Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
-## 🙏 Acknowledgments
+##  Acknowledgments
 
 Built as a capstone project demonstrating real-world security monitoring capabilities.
 
